@@ -27,7 +27,7 @@ Most datasets used in this work can be downloaded through PyTorch Geometric (PyG
 - Shortest path datasets (infected) - these can be generated through PyG using the commands given in the SI of the paper. However, we provide them for convenience.
 - Heterophily datasets (`roman empire`, `amazon ratings`, `minesweeper`, `tolokers`, `squirrel_filtered`, `chameleon_filtered`)
 
-These can be downloaded from [this auxiliary repository](https://github.com/davidbuterez/esa-paper-extra-datasets). The datasets are already in the required format and are ready to be loaded using the data loading pipeline.
+These can be downloaded from [this auxiliary repository](https://github.com/davidbuterez/esa-paper-extra-datasets) (remember to use `git lfs pull` after `git clone`). The datasets are already in the required format and are ready to be loaded using the data loading pipeline.
 
 The only exception is for the Open Catalyst Project (OCP) dataset, as the files would total around 4GB. For OCP, the following files are required from https://fair-chem.github.io/core/datasets/oc20.html:
 
