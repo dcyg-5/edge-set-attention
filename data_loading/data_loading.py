@@ -509,7 +509,7 @@ def load_dockstring_chemprop(dataset_dir, one_hot, target_name, **kwargs):
     else:
         posenc_name = "None"
 
-    preprocessed_path_train = os.path.join(dataset_dir, f"/DOCKSTRING_train_{target_name}_{posenc_name}.pt")
+    preprocessed_path_train = os.path.join(dataset_dir, f"DOCKSTRING_train_{target_name}_{posenc_name}.pt")
     preprocessed_path_val = os.path.join(dataset_dir, f"DOCKSTRING_val_{target_name}_{posenc_name}.pt")
     preprocessed_path_test = os.path.join(dataset_dir, f"DOCKSTRING_test_{target_name}_{posenc_name}.pt")
 
