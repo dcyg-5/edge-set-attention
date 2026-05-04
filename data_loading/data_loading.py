@@ -13,6 +13,7 @@ from ogb.utils import smiles2graph
 from data_loading.pyg_molecular_datasets.qm9 import QM9 as CustomQM9
 from data_loading.pyg_molecular_datasets.molecule_net import MoleculeNet as CustomMoleculeNet
 from data_loading.lrgb import PeptidesFunctionalDataset, PeptidesStructuralDataset
+from data_loading.pdbbind_loader import load_pdbbind_function
 from data_loading.graphgps_utils import join_dataset_splits
 from data_loading.transforms import *
 
@@ -1060,6 +1061,8 @@ def get_dataset_train_val_test(dataset, dataset_dir, **kwargs):
         return load_lrgb_pept_fn(dataset_dir, **kwargs)
     elif dataset == "lrgb-pept-struct":
         return load_lrgb_pept_struct(dataset_dir, **kwargs)
+    elif dataset == "PDBBind":
+        return load_pdbbind_function(dataset_dir, **kwargs)
     elif dataset == "ZINC":
         return load_zinc_benchmark(dataset, dataset_dir, **kwargs)
     elif dataset == "PCQM4Mv2":
