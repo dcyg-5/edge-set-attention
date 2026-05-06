@@ -6,17 +6,16 @@ Constructs protein-ligand complex graphs from PDBBind refined set:
   - Edges: inter-atomic contacts within a distance cutoff (default 6A)
   - Edge features: Gaussian-expanded inter-atomic distance + contact type
   - Target: binding affinity (pKd / pKi / pIC50), regression task
+  - Caching: built graphs saved to <parent_dir>/pdbbind_cache.pt for fast reload
 
 Data source: http://www.pdbbind.org.cn/ (v2020 refined set)
 
 Directory structure expected:
   <root>/
-    INDEX_refined_data.2020  (or similar index)
+    index/INDEX_refined_data.2020  (or INDEX_refined_data.2020 in root)
     <PDB_ID>/
       <PDB_ID>_protein.pdb
       <PDB_ID>_ligand.mol2
-      <PDB_ID>_pocket.pdb   (optional, residues within ~10A of ligand)
-      <PDB_ID>_min.sdf       (optimised ligand geometry)
 """
 
 import os
@@ -27,6 +26,7 @@ from tqdm.auto import tqdm
 from torch_geometric.data import Data, InMemoryDataset
 from torch_geometric.transforms import Compose
 from sklearn.preprocessing import StandardScaler
+from multiprocessing import Pool, cpu_count
 
 from data_loading.transforms import (
     AddMaxEdge,
@@ -35,6 +35,11 @@ from data_loading.transforms import (
     AddMaxNodeGlobal,
     FormatSingleLabel,
 )
+
+# --- Config ---
+MAX_ATOMS = 1500      # skip complexes larger than this
+CUTOFF = 6.0           # edge distance cutoff in Angstrom
+NUM_GAUSSIANS = 64     # number of Gaussian basis for edge features
 
 
 # --- Biopython-free PDB coordinate reader ---
@@ -79,7 +84,7 @@ def parse_mol2_coords(mol2_path):
             if len(parts) >= 6:
                 try:
                     x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
-                    atom = parts[5].split(".")[0]  # e.g. C.3 -> C
+                    atom = parts[5].split(".")[0]
                     coords.append([x, y, z])
                     atom_types.append(atom)
                 except (ValueError, IndexError):
@@ -87,7 +92,7 @@ def parse_mol2_coords(mol2_path):
     return np.array(coords, dtype=np.float32), atom_types
 
 
-# --- Element feature vocabulary (for node features) ---
+# --- Element feature vocabulary ---
 
 ELEMENT_VOCAB = {
     "H": 0, "C": 1, "N": 2, "O": 3, "S": 4, "P": 5, "F": 6,
@@ -95,7 +100,7 @@ ELEMENT_VOCAB = {
     "Fe": 13, "Mn": 14, "Cu": 15, "Na": 16, "K": 17, "OTHER": 18,
 }
 NUM_ELEMENTS = len(ELEMENT_VOCAB)
-ATOM_FEATURE_DIM = NUM_ELEMENTS + 1  # one-hot + is_ligand
+ATOM_FEATURE_DIM = NUM_ELEMENTS + 1
 
 
 def _atom_to_feature(atom_type, is_ligand):
@@ -111,49 +116,39 @@ def gaussian_expansion(distances, min_dist=0.0, max_dist=6.0, num_gaussians=64):
     """Expand distances into Gaussian basis."""
     centers = np.linspace(min_dist, max_dist, num_gaussians)
     widths = (max_dist - min_dist) / (num_gaussians - 1)
-    distances = np.expand_dims(distances, axis=-1)  # N x 1
-    centers = np.expand_dims(centers, axis=0)        # 1 x G
+    distances = np.expand_dims(distances, axis=-1)
+    centers = np.expand_dims(centers, axis=0)
     return np.exp(-0.5 * ((distances - centers) / widths) ** 2)
 
 
-# --- Main graph construction ---
+# --- Single graph construction (standalone for multiprocessing) ---
 
-def construct_pdbbind_graph(complex_dir, pdb_id, index_row, cutoff=6.0, num_gaussians=64):
+def _build_single_graph(args):
     """
-    Construct a PyG Data object for one PDBBind complex.
-
-    Returns:
-        Data with fields:
-          - x: node features (atom type one-hot + ligand flag)
-          - edge_index: [2, E] contact edges
-          - edge_attr: [E, num_gaussians] distance features
-          - y: binding affinity (pKd/pKi)
-          - num_nodes, num_edges (for padding)
+    Build one PDBBind graph. Standalone function for multiprocessing.
+    Returns (Data or None, pdb_id).
     """
+    complex_dir, pdb_id, affinity = args
     protein_pdb = os.path.join(complex_dir, f"{pdb_id}_protein.pdb")
     ligand_mol2 = os.path.join(complex_dir, f"{pdb_id}_ligand.mol2")
 
     if not os.path.exists(protein_pdb) or not os.path.exists(ligand_mol2):
-        # Try alternative naming
-        protein_pdb = os.path.join(complex_dir, f"{pdb_id}_protein.pdb")
-        ligand_mol2 = os.path.join(complex_dir, f"{pdb_id}_ligand.mol2")
-        if not os.path.exists(protein_pdb) or not os.path.exists(ligand_mol2):
-            return None
+        return None, pdb_id
 
-    # Parse coordinates
     prot_coords, prot_atoms, _ = parse_pdb_coords(protein_pdb)
     lig_coords, lig_atoms = parse_mol2_coords(ligand_mol2)
 
     if len(prot_coords) == 0 or len(lig_coords) == 0:
-        return None
+        return None, pdb_id
 
-    # Combine protein + ligand
-    all_coords = np.vstack([prot_coords, lig_coords])
+    total_n = len(prot_coords) + len(lig_coords)
+    if total_n > MAX_ATOMS:
+        return None, pdb_id
+
     n_prot = len(prot_coords)
-    n_lig = len(lig_coords)
-    total_n = n_prot + n_lig
+    all_coords = np.vstack([prot_coords, lig_coords])
 
-    # Node features: one-hot atom type + ligand flag
+    # Node features
     node_features = []
     for atom in prot_atoms:
         node_features.append(_atom_to_feature(atom, is_ligand=False))
@@ -161,25 +156,24 @@ def construct_pdbbind_graph(complex_dir, pdb_id, index_row, cutoff=6.0, num_gaus
         node_features.append(_atom_to_feature(atom, is_ligand=True))
     x = torch.tensor(node_features, dtype=torch.float)
 
-    # Build edges: all atom pairs within cutoff distance
-    # (only cross protein-ligand + within-ligand, skip protein-protein to keep graph manageable)
+    # Build edges: cross protein-ligand + within-ligand, skip protein-protein
     edge_indices = []
     edge_dists = []
 
     for i in range(total_n):
-        start_j = 0 if i >= n_prot else n_prot  # protein only connects to ligand, ligand connects to all
+        start_j = 0 if i >= n_prot else n_prot
         for j in range(start_j, total_n):
             if i >= j:
                 continue
             d = np.linalg.norm(all_coords[i] - all_coords[j])
-            if d < cutoff:
+            if d < CUTOFF:
                 edge_indices.append([i, j])
                 edge_indices.append([j, i])
                 edge_dists.append(d)
                 edge_dists.append(d)
 
     if len(edge_indices) == 0:
-        # Fallback: nearest neighbor connection for each ligand atom
+        # Fallback: nearest neighbor
         for i in range(n_prot, total_n):
             dists = np.linalg.norm(all_coords[:n_prot] - all_coords[i], axis=1)
             nearest = np.argmin(dists)
@@ -188,128 +182,113 @@ def construct_pdbbind_graph(complex_dir, pdb_id, index_row, cutoff=6.0, num_gaus
             edge_dists.append(dists[nearest])
             edge_dists.append(dists[nearest])
 
-    edge_index = torch.tensor(edge_indices, dtype=torch.long).T  # [2, E]
-
-    # Edge features: Gaussian expansion of distances
+    edge_index = torch.tensor(edge_indices, dtype=torch.long).T
     edge_dists = np.array(edge_dists, dtype=np.float32)
-    edge_attr = torch.tensor(gaussian_expansion(edge_dists, 0.0, cutoff, num_gaussians), dtype=torch.float)
+    edge_attr = torch.tensor(gaussian_expansion(edge_dists, 0.0, CUTOFF, NUM_GAUSSIANS), dtype=torch.float)
 
-    # Target: binding affinity
-    affinity_key = index_row.get("affinity_key", "pKd")
-    if affinity_key in index_row and pd.notna(index_row[affinity_key]):
-        y = torch.tensor([[float(index_row[affinity_key])]], dtype=torch.float)
-    else:
-        return None
-
+    y = torch.tensor([[affinity]], dtype=torch.float)
     data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
-
-    # Add metadata for padding (needed by ESA transforms)
     data.max_node = total_n
     data.max_edge = edge_index.shape[1]
 
-    return data
+    return data, pdb_id
 
 
-# --- Main loader function ---
+# --- Main loader with caching ---
 
 def load_pdbbind(dataset_dir, one_hot=True, target_name=None, **kwargs):
     """
-    Load PDBBind refined set.
+    Load PDBBind refined set with caching.
 
     Args:
-        dataset_dir: Path to PDBBind v2020 refined set (contains 'INDEX_refined_data.2020')
-        one_hot: Already true by default for PDBBind
-        target_name: Ignored (PDBBind has only one target per entry)
-    
+        dataset_dir: Path to PDBBind v2020 refined set
+
     Returns:
         train, val, test datasets, num_classes, task_type, scaler
     """
-    # Parse index file
+    cache_path = os.path.join(os.path.dirname(os.path.abspath(dataset_dir)), "pdbbind_cache.pt")
+
+    # Fast path: load from cache
+    if os.path.exists(cache_path):
+        print(f"Loading cached PDBBind graphs from {cache_path}...")
+        cache = torch.load(cache_path, map_location="cpu", weights_only=False)
+        max_nodes = cache["max_nodes"]
+        max_edges = cache["max_edges"]
+        scaler = cache["scaler"]
+
+        def rebuild(samples, mx_n, mx_e):
+            t = Compose([AddMaxEdgeGlobal(mx_e), AddMaxNodeGlobal(mx_n)])
+            data_list = []
+            for x, ei, ea, y in tqdm(samples, desc="Rebuilding from cache"):
+                d = Data(x=x, edge_index=ei, edge_attr=ea, y=y)
+                d.max_node = mx_n
+                d.max_edge = mx_e
+                d = t(d)
+                data_list.append(d)
+            return _wrap_dataset(data_list)
+
+        train_ds = rebuild(cache["train"], max_nodes, max_edges)
+        val_ds = rebuild(cache["val"], max_nodes, max_edges)
+        test_ds = rebuild(cache["test"], max_nodes, max_edges)
+        n_train = len(cache["train"])
+        n_val = len(cache["val"])
+        n_test = len(cache["test"])
+        print(f"Loaded {n_train} train / {n_val} val / {n_test} test graphs (cached)")
+        return train_ds, val_ds, test_ds, 1, "regression", scaler
+
+    # Slow path: build from scratch
+    # Find index file
     index_path = os.path.join(dataset_dir, "INDEX_refined_data.2020")
-    
-    if os.path.exists(index_path):
-        # Standard PDBBind index format: column-based
-        rows = []
-        with open(index_path, "r") as f:
-            for line in f:
-                if line.startswith("#") or line.strip() == "":
-                    continue
-                parts = line.strip().split()
-                if len(parts) >= 4:
-                    pdb_id = parts[0]
-                    resolution = parts[1]
-                    release_year = parts[2]
-                    # pKd/pKi/pIC50 is usually the last column
-                    affinity_str = parts[-1]
-                    try:
-                        affinity = float(affinity_str)
-                    except ValueError:
-                        continue
-                    rows.append({
-                        "pdb_id": pdb_id,
-                        "resolution": resolution,
-                        "year": release_year,
-                        "pKd": affinity,
-                    })
-        index_df = pd.DataFrame(rows)
-        affinity_key = "pKd"
-    else:
-        # Try alternative: General PDBBind v2020 index files
-        alt_paths = [
-            os.path.join(dataset_dir, "INDEX_general_PL_data.2020"),
-            os.path.join(dataset_dir, "INDEX_refined_data.2016"),
-            os.path.join(dataset_dir, "index", "INDEX_refined_data.2020"),
-        ]
+    alt_paths = [
+        os.path.join(dataset_dir, "INDEX_general_PL_data.2020"),
+        os.path.join(dataset_dir, "INDEX_refined_data.2016"),
+        os.path.join(dataset_dir, "index", "INDEX_refined_data.2020"),
+    ]
+    if not os.path.exists(index_path):
         for ap in alt_paths:
             if os.path.exists(ap):
                 index_path = ap
                 break
         else:
             raise FileNotFoundError(
-                f"No PDBBind index file found in {dataset_dir}. "
-                f"Expected INDEX_refined_data.2020 or similar."
+                f"No PDBBind index file found in {dataset_dir}."
             )
-        rows = []
-        with open(index_path, "r") as f:
-            for line in f:
-                if line.startswith("#") or line.strip() == "":
-                    continue
-                parts = line.strip().split()
-                if len(parts) >= 4:
-                    pdb_id = parts[0]
-                    try:
-                        affinity = float(parts[-1])
-                    except ValueError:
-                        continue
-                    rows.append({
-                        "pdb_id": pdb_id,
-                        "pKd": affinity,
-                    })
-        index_df = pd.DataFrame(rows)
-        affinity_key = "pKd"
 
+    # Parse index
+    rows = []
+    with open(index_path, "r") as f:
+        for line in f:
+            if line.startswith("#") or line.strip() == "":
+                continue
+            parts = line.strip().split()
+            if len(parts) >= 4:
+                pdb_id = parts[0]
+                try:
+                    affinity = float(parts[3])
+                except ValueError:
+                    continue
+                rows.append({"pdb_id": pdb_id, "pKd": affinity})
+
+    index_df = pd.DataFrame(rows)
     print(f"Found {len(index_df)} complexes in PDBBind index.")
 
-    # Shuffle and split
+    # Split
     index_df = index_df.sample(frac=1.0, random_state=42).reset_index(drop=True)
     n_total = len(index_df)
     n_train = int(n_total * 0.8)
     n_val = int(n_total * 0.1)
-
     train_df = index_df.iloc[:n_train]
     val_df = index_df.iloc[n_train:n_train + n_val]
     test_df = index_df.iloc[n_train + n_val:]
-
     print(f"Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
 
-    # Construct graphs
-    def process_split(df, split_name):
-        data_list = []
-        for _, row in tqdm(df.iterrows(), desc=f"Processing {split_name}", total=len(df)):
+    # Prepare args for multiprocessing
+    def df_to_args(df):
+        args_list = []
+        for _, row in df.iterrows():
             pdb_id = row["pdb_id"]
             complex_dir = os.path.join(dataset_dir, pdb_id)
             if not os.path.isdir(complex_dir):
-                # Try uppercase/lowercase variants
                 for alt in [pdb_id.lower(), pdb_id.upper()]:
                     alt_dir = os.path.join(dataset_dir, alt)
                     if os.path.isdir(alt_dir):
@@ -317,47 +296,58 @@ def load_pdbbind(dataset_dir, one_hot=True, target_name=None, **kwargs):
                         break
                 else:
                     continue
-            data = construct_pdbbind_graph(
-                complex_dir, pdb_id, row, cutoff=6.0, num_gaussians=64
-            )
+            args_list.append((complex_dir, pdb_id, row["pKd"]))
+        return args_list
+
+    train_args = df_to_args(train_df)
+    val_args = df_to_args(val_df)
+    test_args = df_to_args(test_df)
+
+    # Build graphs with multiprocessing
+    num_workers = min(8, cpu_count())
+    print(f"\nBuilding graphs with {num_workers} workers (max {MAX_ATOMS} atoms per graph)...")
+
+    def build_split(args_list, split_name):
+        if len(args_list) == 0:
+            return []
+        data_list = []
+        with Pool(num_workers) as pool:
+            results = list(tqdm(
+                pool.imap_unordered(_build_single_graph, args_list),
+                total=len(args_list),
+                desc=f"Building {split_name}"
+            ))
+        for data, pdb_id in results:
             if data is not None:
                 data_list.append(data)
+        print(f"  {split_name}: {len(data_list)} / {len(args_list)} complexes built")
         return data_list
 
-    print("\nBuilding graphs...")
-    train_list = process_split(train_df, "train")
-    val_list = process_split(val_df, "val")
-    test_list = process_split(test_df, "test")
+    train_list = build_split(train_args, "train")
+    val_list = build_split(val_args, "val")
+    test_list = build_split(test_args, "test")
 
-    print(f"\nBuilt {len(train_list)} train / {len(val_list)} val / {len(test_list)} test graphs")
+    total_built = len(train_list) + len(val_list) + len(test_list)
+    print(f"\nBuilt {len(train_list)} train / {len(val_list)} val / {len(test_list)} test graphs (total: {total_built})")
 
     if len(train_list) == 0:
-        raise RuntimeError(
-            "No graphs could be built. Check PDBBind directory structure:\n"
-            f"  {dataset_dir}\n"
-            "Expected subdirectories named by PDB ID, each containing\n"
-            "  *_protein.pdb and *_ligand.mol2 files."
-        )
+        raise RuntimeError("No graphs could be built. Check PDBBind directory structure.")
 
-    # Determine max nodes / max edges globally
+    # Determine max nodes/edges
     max_nodes = max(d.max_node for d in train_list + val_list + test_list)
     max_edges = max(d.max_edge for d in train_list + val_list + test_list)
-    print(f"Max nodes per graph: {max_nodes}, Max edges per graph: {max_edges}")
+    print(f"Max nodes: {max_nodes}, Max edges: {max_edges}")
 
-    # Apply global transforms
-    transforms = Compose([
-        AddMaxEdgeGlobal(max_edges),
-        AddMaxNodeGlobal(max_nodes),
-    ])
+    # Apply padding transforms
+    tf = Compose([AddMaxEdgeGlobal(max_edges), AddMaxNodeGlobal(max_nodes)])
+    train_list = [tf(d) for d in tqdm(train_list, desc="Padding train")]
+    val_list = [tf(d) for d in tqdm(val_list, desc="Padding val")]
+    test_list = [tf(d) for d in tqdm(test_list, desc="Padding test")]
 
-    train_list = [transforms(d) for d in tqdm(train_list, desc="Transforming train")]
-    val_list = [transforms(d) for d in tqdm(val_list, desc="Transforming val")]
-    test_list = [transforms(d) for d in tqdm(test_list, desc="Transforming test")]
-
-    # Scale regression target
+    # Scale targets
     scaler = StandardScaler()
     y_train = np.array([d.y.squeeze().item() for d in train_list], dtype=float).reshape(-1, 1)
-    scaler = scaler.fit(y_train)
+    scaler.fit(y_train)
 
     def apply_scaler(data):
         data.y = torch.tensor(scaler.transform(data.y.reshape(1, -1).numpy()))
@@ -367,16 +357,23 @@ def load_pdbbind(dataset_dir, one_hot=True, target_name=None, **kwargs):
     val_list = [apply_scaler(d) for d in tqdm(val_list, desc="Scaling val")]
     test_list = [apply_scaler(d) for d in tqdm(test_list, desc="Scaling test")]
 
-    # Wrap as InMemoryDataset
+    # Wrap as datasets
     train_ds = _wrap_dataset(train_list)
     val_ds = _wrap_dataset(val_list)
     test_ds = _wrap_dataset(test_list)
 
-    num_classes = 1
-    task_type = "regression"
+    # Save cache
+    torch.save({
+        "train": [(d.x, d.edge_index, d.edge_attr, d.y) for d in train_list],
+        "val": [(d.x, d.edge_index, d.edge_attr, d.y) for d in val_list],
+        "test": [(d.x, d.edge_index, d.edge_attr, d.y) for d in test_list],
+        "max_nodes": max_nodes,
+        "max_edges": max_edges,
+        "scaler": scaler,
+    }, cache_path)
+    print(f"Saved cache to {cache_path}")
 
-    print("PDBBind loading complete!")
-    return train_ds, val_ds, test_ds, num_classes, task_type, scaler
+    return train_ds, val_ds, test_ds, 1, "regression", scaler
 
 
 class _PDBBindInMemory(InMemoryDataset):
@@ -396,7 +393,7 @@ def _wrap_dataset(data_list):
     return _PDBBindInMemory(data_list)
 
 
-# --- Custom loader export (for use in data_loading.py) ---
+# --- Custom loader export ---
 
 def load_pdbbind_function(dataset_dir, **kwargs):
     """Compatible interface for ESA's get_dataset_train_val_test."""
